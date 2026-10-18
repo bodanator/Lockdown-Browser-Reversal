@@ -1,7 +1,7 @@
 # Lockdown-Browser-Reversal
 Complete analysis on findings from my time reversing the lockdown browser + driver binaries. 
 
-# LockDown Browser — Reverse Engineering Analysis
+# Reverse Engineering Analysis
 
 A complete reverse engineering breakdown of Respondus LockDown Browser's anti-cheat detection systems, covering both the usermode application (`LockDownBrowser.exe`) and the kernel driver (`LockDownService215.sys`).
 
