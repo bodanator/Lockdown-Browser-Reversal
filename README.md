@@ -344,7 +344,7 @@ Each pseudocode file contains:
 
 3. **Communication is encrypted.** Driver↔usermode messages use RSA+AES-CBC. Sniffing the FilterPort won't reveal detection data.
 
-4. **Process names are checked server-side.** The full process list is sent to the server. Disguising as a system process (`TextInputHost.exe`) avoids server-side blocklist matching.
+4. **Process names are checked server-side.** The full process list is sent to the server. Disguising as a system process avoids server-side blocklist matching.
 
 5. **DWM integrity is checked.** If you hook DWM to bypass `SetWindowDisplayAffinity`, the driver will detect the tampering.
 
