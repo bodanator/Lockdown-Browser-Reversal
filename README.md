@@ -148,7 +148,7 @@ Enumerates every running process and sends the full list to the server.
 - Builds structured list and sends encrypted to server
 - Server compares against blocklist
 
-**Bypass:** Process name must not match any blocked names. `TextInputHost.exe` mimics a legitimate Windows system process.
+**Bypass:** Process name must not match any blocked names.
 
 ### 3. Window Enumeration
 Scans all visible windows to detect tools.
