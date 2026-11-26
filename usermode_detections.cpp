@@ -2,12 +2,19 @@
 //  LockDown Browser — Usermode Detection Pseudocode
 //  Reverse engineered from LockDownBrowser.exe
 //  SHA256: 86f39c5a239a0ff69f3e6b3bd8833f455eecbbacc2890fe68819425098bc8040
-//  PE x86_64, ~20MB
+//  PE x86_64, 20,826,048 bytes
+//
+//  Full analysis via Ghidra 12.2 and targeted string extraction.
+//  All addresses verified against binary.
 // =============================================================================
 
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
+#include <wininet.h>
+#include <bcrypt.h>
+#include <fltuser.h>
+#include <mmsystem.h>
 #include <string>
 #include <vector>
 
@@ -660,4 +667,427 @@ class DisplayMonitorFingerprint {
 
         return TRUE;
     }
+};
+
+
+// =============================================================================
+//  15. CEF/CHROMIUM NAVIGATION LOCKDOWN
+//
+//  5 distinct OnBeforeBrowse handlers controlling all browser navigation.
+//  Dual blacklist/whitelist URL filtering with stem matching.
+//  Canvas LMS monitoring via OnBeforeResourceLoad state parameters.
+//
+//  String evidence:
+//    0x00B1657D: "OnBeforeBrowse - browser ID = %d, is-subframe = %d, type = %d, URL = %s"
+//    0x00B165C5: "OnBeforeBrowse - ignoring because i, e, c = %d %d %d"
+//    0x00B289B8: "OnBeforeBrowseLiveProctoring - %s"
+//    0x00B2B778: "OnBeforeBrowseLiveChatSysCheck bid = %d url = %s"
+//    0x00B2B950: "OnBeforeBrowseLiveChatGeneric bid = %d url = %s"
+// =============================================================================
+
+class CLDBRequestHandler {
+public:
+    bool OnBeforeBrowse(HWND browser, const char* url, int browserId, bool isSubframe) {
+        // "OnBeforeBrowse - ignoring because i, e, c = %d %d %d"
+        if (shouldIgnore(browserId))
+            return false;
+
+        // "OnBeforeBrowse - browser ID = %d, is-subframe = %d, type = %d, URL = %s"
+        if (isBlacklisted(url)) return true;
+        if (!isWhitelisted(url)) return true;
+        return false;
+    }
+
+    bool OnBeforeBrowseLiveProctoring(const char* url) {
+        // "OnBeforeBrowseLiveProctoring - %s"
+        return validateProctoringUrl(url);
+    }
+
+    bool OnBeforeBrowseLiveChatSysCheck(int browserId, const char* url) {
+        // "OnBeforeBrowseLiveChatSysCheck bid = %d url = %s"
+        return true;
+    }
+
+    bool OnBeforeBrowseLiveChatGeneric(int browserId, const char* url) {
+        // "OnBeforeBrowseLiveChatGeneric bid = %d url = %s"
+        return true;
+    }
+
+    // "OnBeforeResourceLoad - Canvas mon=%d ps=%d pcom=%d st=%d stcom=%d msg=%d"
+    int OnBeforeResourceLoad(const char* url) {
+        // Canvas monitoring parameters:
+        //   mon  = canvas monitor active
+        //   ps   = process state
+        //   pcom = process complete
+        //   st   = state
+        //   stcom = state complete
+        //   msg  = message count
+
+        if (isFilteredChromeCommand(url)) return 1;  // "filter-chrome-commands"
+        if (isFilteredUrl(url)) return 1;             // "filter-url"
+        return 0;
+    }
+
+private:
+    int m_canvasMonitorActive;
+    int m_processState;
+    int m_processComplete;
+    int m_state;
+    int m_stateComplete;
+    int m_messageCount;
+
+    bool isBlacklisted(const char* url);
+    bool isWhitelisted(const char* url);
+    bool isFilteredChromeCommand(const char* url);
+    bool isFilteredUrl(const char* url);
+    bool shouldIgnore(int browserId);
+    bool validateProctoringUrl(const char* url);
+};
+
+
+// =============================================================================
+//  16. NETWORK & TELEMETRY MANAGER
+//
+//  AWS S3 direct upload with SigV4 authentication.
+//  MAC address fingerprinting on exam data uploads.
+//  Google Analytics telemetry embedded.
+//
+//  String evidence:
+//    0x00B0F740: "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s/us-east-1/s3/aws4_request,
+//                 SignedHeaders=content-md5;content-type;host;x"
+//    "upload_zip.do?token=%s&key=%s&studentKey=%s&type=%s&time=%s&mac=%s"
+//    "upload_logs.do"
+//    "s3.amazonaws.com (Help Center logs)"
+//
+//  Server endpoints:
+//    ask.respondus.com, file.respondus.com, extension.respondus.com,
+//    downloads.respondus.com, d9unvfzorf0bo.cloudfront.net (CDN),
+//    ws.readspeaker.com (TTS), tiny.cloud (TinyMCE), google-analytics.com
+// =============================================================================
+
+class NetworkManager {
+public:
+    bool uploadToS3(const void* data, size_t length, const char* bucket, const char* key) {
+        char authHeader[512];
+        snprintf(authHeader, sizeof(authHeader),
+            "Authorization: AWS4-HMAC-SHA256 Credential=%s/%s/us-east-1/s3/aws4_request,"
+            "SignedHeaders=content-md5;content-type;host;x",
+            m_accessKeyId, m_dateStamp);
+        return httpPut(bucket, key, data, length, authHeader, "binary/octet-stream");
+    }
+
+    // MAC address fingerprinting in every exam upload
+    bool uploadExamData(const char* token, const char* key,
+                        const char* studentKey, const char* type) {
+        char macAddress[18];
+        getDeviceMac(macAddress);
+
+        char url[512];
+        snprintf(url, sizeof(url),
+            "upload_zip.do?token=%s&key=%s&studentKey=%s&type=%s&time=%s&mac=%s",
+            token, key, studentKey, type, getCurrentTime(), macAddress);
+        return httpPost(url, m_examZipData, m_examZipSize);
+    }
+
+    bool uploadLogs() {
+        // "upload_logs.do"
+        return httpPost("upload_logs.do", m_logBuffer, m_logSize);
+    }
+
+private:
+    char m_accessKeyId[64];
+    char m_dateStamp[16];
+    void* m_examZipData;
+    size_t m_examZipSize;
+    void* m_logBuffer;
+    size_t m_logSize;
+
+    bool httpPut(const char*, const char*, const void*, size_t, const char*, const char*);
+    bool httpPost(const char*, const void*, size_t);
+    void getDeviceMac(char*);
+    const char* getCurrentTime();
+};
+
+
+// =============================================================================
+//  17. REGISTRY POLICY MANAGER
+//
+//  Manipulates Windows group policy registry keys to enforce lockdown.
+//
+//  String evidence:
+//    0x00B1AC39: "Policies\Google\Chrome"
+//    "Policies\System"
+//    "Policies\Explorer"
+// =============================================================================
+
+class RegistryPolicyManager {
+public:
+    void lockdownChromePolicies() {
+        // HKLM\SOFTWARE\Policies\Google\Chrome
+        setRegistryPolicy(L"SOFTWARE\\Policies\\Google\\Chrome");
+    }
+
+    void lockdownSystemPolicies() {
+        // HKLM\SOFTWARE\...\Policies\System
+        setRegistryPolicy(
+            L"SOFTWARE\\Policies\\Microsoft\\Windows\\CurrentVersion\\Policies\\System");
+    }
+
+    void lockdownExplorerPolicies() {
+        // HKLM\SOFTWARE\...\Policies\Explorer
+        setRegistryPolicy(
+            L"SOFTWARE\\Policies\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer");
+    }
+
+private:
+    void setRegistryPolicy(const wchar_t* path);
+};
+
+
+// =============================================================================
+//  18. SINGLE INSTANCE ENFORCEMENT
+//
+//  Two mutexes prevent multiple instances of LDB.
+//
+//  String evidence:
+//    0x00B4C8F8: "Local\{C15730E2-145C-4c5e-B005-3BC753F42475}-once-flag"
+//    0x00B32D60: "Local\87543720949%u41187%u2617649587"
+// =============================================================================
+
+class SingleInstanceManager {
+public:
+    bool acquireLock() {
+        // Static GUID mutex — global single instance
+        m_onceFlagMutex = CreateMutexW(nullptr, TRUE,
+            L"Local\\{C15730E2-145C-4c5e-B005-3BC753F42475}-once-flag");
+        if (GetLastError() == ERROR_ALREADY_EXISTS)
+            return false;
+
+        // Dynamic session mutex — numeric obfuscation with PID
+        wchar_t sessionMutex[128];
+        swprintf_s(sessionMutex, L"Local\\87543720949%u41187%u2617649587",
+                   GetCurrentProcessId());
+        m_sessionMutex = CreateMutexW(nullptr, TRUE, sessionMutex);
+
+        return true;
+    }
+
+private:
+    HANDLE m_onceFlagMutex;
+    HANDLE m_sessionMutex;
+};
+
+
+// =============================================================================
+//  19. ANTI-DEBUG (Minimal)
+//
+//  Only two anti-debug checks found — no advanced techniques.
+//
+//  String evidence:
+//    Import: IsDebuggerPresent (KERNEL32)
+//    0x00B0BA6E: "debug_registers"
+// =============================================================================
+
+class AntiDebug {
+public:
+    bool isDebuggerAttached() {
+        return IsDebuggerPresent();  // PEB.BeingDebugged
+    }
+
+    bool areHardwareBreakpointsSet() {
+        // "debug_registers" — DR0-DR3 inspection
+        CONTEXT ctx = {};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        GetThreadContext(GetCurrentThread(), &ctx);
+        return (ctx.Dr0 || ctx.Dr1 || ctx.Dr2 || ctx.Dr3);
+    }
+
+    // No NtQueryInformationProcess
+    // No ThreadHideFromDebugger
+    // No timing checks
+    // No int2d tricks
+};
+
+
+// =============================================================================
+//  20. INTEGRITY CHECKER — PE checksum + TLSH fuzzy hash
+//
+//  Validates binary integrity with both exact and fuzzy methods.
+//  TLSH catches patched binaries that differ from expected hash.
+//
+//  String evidence:
+//    0x00B4F50F: "checksum = %ld; the header checksum = %ld"
+//    0x00B379F6: "tlsh that is already valid"
+// =============================================================================
+
+class IntegrityChecker {
+public:
+    bool validateChecksum(const wchar_t* filePath) {
+        // "checksum = %ld; the header checksum = %ld"
+        DWORD calculated = calculatePEChecksum(filePath);
+        DWORD header = readHeaderChecksum(filePath);
+        return calculated == header;
+    }
+
+    bool validateFuzzyHash(const void* data, size_t len) {
+        // TLSH (Trend Micro Locality Sensitive Hash)
+        // "tlsh that is already valid"
+        // Detects modified/patched versions even if exact hash differs
+        return computeTLSH(data, len, m_expectedTLSH);
+    }
+
+private:
+    char m_expectedTLSH[72];
+    DWORD calculatePEChecksum(const wchar_t*);
+    DWORD readHeaderChecksum(const wchar_t*);
+    bool computeTLSH(const void*, size_t, const char*);
+};
+
+
+// =============================================================================
+//  21. WEBCAM & AUDIO CAPTURE (Respondus Monitor)
+//
+//  Camera hotplug detection with retry logic.
+//  Legacy WinMM audio capture (waveIn* APIs).
+//  No local ML/face detection — server-side processing.
+//
+//  String evidence:
+//    0x00B16BF0: "webcam new camera connected = (%s)"
+//    "webcam DISconnected = (%s)"
+//    "webcam RE-connected = (%s)"
+//    "camera reconnect = %d, camera retry = %d"
+//    "webcam check" / "webcam check complete, closing - %d"
+//
+//  Proctoring endpoints:
+//    "proctoring_start_cancel.do"
+//    "proctoring_continue.do"
+// =============================================================================
+
+class WebcamCapture {
+public:
+    void startCapture(const char* cameraName) {
+        // "webcam check" → "webcam check complete, closing - %d"
+        // "webcam new camera connected = (%s)"
+    }
+
+    void onDisconnect(const char* cameraName) {
+        // "webcam DISconnected = (%s)"
+        attemptReconnect();
+    }
+
+    void onReconnect(const char* cameraName) {
+        // "webcam RE-connected = (%s)"
+    }
+
+    void attemptReconnect() {
+        m_retryCount++;
+        // "camera reconnect = %d, camera retry = %d"
+    }
+
+private:
+    int m_reconnectCount;
+    int m_retryCount;
+};
+
+class AudioCapture {
+public:
+    // waveIn* API — legacy WinMM microphone capture
+    bool startRecording() {
+        UINT numDevs = waveInGetNumDevs();
+        if (numDevs == 0) return false;
+
+        WAVEFORMATEX fmt = {};
+        fmt.wFormatTag = WAVE_FORMAT_PCM;
+        fmt.nChannels = 1;
+        fmt.nSamplesPerSec = 44100;
+        fmt.wBitsPerSample = 16;
+        fmt.nBlockAlign = 2;
+        fmt.nAvgBytesPerSec = 88200;
+
+        return waveInOpen(&m_hWaveIn, 0, &fmt, (DWORD_PTR)waveInProc, 0,
+                         CALLBACK_FUNCTION) == MMSYSERR_NOERROR;
+    }
+
+private:
+    HWAVEIN m_hWaveIn;
+    static void CALLBACK waveInProc(HWAVEIN, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR);
+};
+
+
+// =============================================================================
+//  22. DISPLAY AFFINITY CONTROLLER
+//
+//  Prevents screen capture via SetWindowDisplayAffinity.
+//
+//  Import evidence:
+//    SetWindowDisplayAffinity at 0x00CACF8E
+// =============================================================================
+
+class DisplayAffinityController {
+public:
+    bool setExcludeFromCapture(HWND hwnd) {
+        // WDA_EXCLUDEFROMCAPTURE — Windows 10 2004+, content appears black
+        BOOL result = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        if (!result) {
+            // WDA_MONITOR fallback — older Windows, shows wallpaper
+            result = SetWindowDisplayAffinity(hwnd, WDA_MONITOR);
+        }
+        return result != FALSE;
+    }
+};
+
+
+// =============================================================================
+//  23. OFFLINE EXAM CACHING
+//
+//  Supports offline exam delivery with retry logic.
+//
+//  String evidence:
+//    0x00B2C1F3: "offline=%d course=%s test=%s cached=%d cached-id=%s Is retry = %d"
+// =============================================================================
+
+class OfflineManager {
+public:
+    void cacheExam(const char* courseId, const char* testId) {
+        // "offline=%d course=%s test=%s cached=%d cached-id=%s Is retry = %d"
+    }
+
+private:
+    bool m_offline;
+    bool m_cached;
+    char m_cachedId[64];
+    int m_isRetry;
+};
+
+
+// =============================================================================
+//  24. PING / KEEPALIVE THREAD
+//
+//  Background thread maintaining server session heartbeat.
+//
+//  String evidence:
+//    0x00B12BFC: "ping notification thread"
+//    "ping EndExam() -- quiz_active = %d, quiz_completed = %d"
+//    "ping suggestions"
+// =============================================================================
+
+class PingThread {
+public:
+    static DWORD WINAPI threadProc(LPVOID param) {
+        PingThread* self = static_cast<PingThread*>(param);
+        while (self->m_running) {
+            // "ping EndExam() -- quiz_active = %d, quiz_completed = %d"
+            self->sendPing(self->m_quizActive, self->m_quizCompleted);
+            Sleep(self->m_intervalMs);
+        }
+        return 0;
+    }
+
+private:
+    bool m_running;
+    bool m_quizActive;
+    bool m_quizCompleted;
+    DWORD m_intervalMs;
+
+    void sendPing(bool quizActive, bool quizCompleted);
 };
